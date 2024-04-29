@@ -1,0 +1,538 @@
+---
+title: "Project Modeling"
+author: "STOR 320.002 Group 2"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(rvest)
+library(noncensus)
+library(readr)
+library(knitr)
+
+#Import modeling
+library(modelr)
+library(broom)
+
+# Import Data Below
+EFI = read_csv("Clean_EFI.csv") 
+EFI2 = EFI
+write.csv(EFI2, "Clean_EFI.csv", row.names = F)
+
+EFI_2024 = read_csv("EFI_DATA_2024.csv") %>%
+  select(-c(17)) %>%
+  filter(!is.na(EFS),
+         !is.na(GDP_per_Capita_PPP),
+         !is.na(Tariff_Rate),
+         !is.na(Inflation_rate),
+         !is.na(Tax_Burden_percent_of_GDP),
+         !is.na(FDI_Inflow_Millions),
+         !is.na(Corporate_Tax_Rate),
+         !is.na(Unemployment_rate))
+```
+
+```{r}
+MAE.func <- function(x) {
+  mean(abs(x))
+}
+
+RMSE.func <- function(x) {
+  sqrt(mean(x^2))
+}
+```
+
+```{r}
+# Clean EFI Data, Remove NA's, and Find Correlations with EFS
+EFI_DATA <- rename(EFI, EFS = `2019_Score`) %>%
+  select(Country, EFS, Tariff_Rate:Public_Debt_percent_of_GDP) %>%
+  filter(Country != "Venezuela") %>%  # Exclude Venezuela
+  filter(!is.na(EFS),
+         !is.na(GDP_per_Capita_PPP),
+         !is.na(Tariff_Rate),
+         !is.na(Inflation_rate),
+         !is.na(Tax_Burden_percent_of_GDP),
+         !is.na(FDI_Inflow_Millions),
+         !is.na(Corporate_Tax_Rate),
+         !is.na(Unemployment_rate))
+
+#Finding the variables with the higheset correlation with EFS(2019_score)
+correlations = EFI_DATA %>%
+  select(EFS, Tariff_Rate:Public_Debt_percent_of_GDP) %>%
+  cor(use="complete.obs") %>%
+  .[1,]
+
+# Correlations with EFS
+correlations
+```
+
+```{r}
+#SPLIT initial EFI INTO TEST AND TRAIN DATASETS
+set.seed(123)
+
+EFI_DATA = EFI_DATA %>%
+  mutate(SET = sample(x=c("TRAIN", "TEST"), 
+         size=n(),
+         replace=T, 
+         prob=c(0.8, 0.2)))
+
+TRAIN = EFI_DATA %>% filter(SET=="TRAIN")
+TEST = EFI_DATA %>% filter(SET=="TEST")
+
+```
+
+
+```{r}
+# Model 0: All 14 variables
+lm_full <- lm(EFS ~ Govt_Expenditure_percent_of_GDP + Tax_Burden_percent_of_GDP + 
+              GDP_Growth_Rate + FDI_Inflow_Millions + GDP_Billions_PPP +
+              Population_Millions + Corporate_Tax_Rate + Unemployment_rate +
+              Tax_Burden_percent_of_GDP + Govt_Expenditure_percent_of_GDP +
+              Five_Year_GDP_Growth_Rate + Public_Debt_percent_of_GDP +
+              Income_Tax_Rate + Tariff_Rate + GDP_per_Capita_PPP + 
+              Inflation_rate, data = TRAIN)
+summary(lm_full)
+
+# Add Predictions to TEST
+TEST2 = TEST %>%
+  add_predictions(lm_full, var="pred0") %>%
+  add_residuals(lm_full, var="resid0") %>%
+  select(Country, EFS, pred0, resid0)
+
+# Calculate MAE
+MAE.func(TEST2$resid0)
+```
+
+```{r, warning=FALSE}
+# Model 1: High-Correlation Variables
+lm1 <- lm(EFS ~ GDP_per_Capita_PPP + Tariff_Rate + Inflation_rate + Tax_Burden_percent_of_GDP, data = TRAIN)
+
+# Model 2: Government-related Metrics with Interaction
+lm2 <- lm(EFS ~ (Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Corporate_Tax_Rate) +
+           (Tax_Burden_percent_of_GDP * poly(FDI_Inflow_Millions, 2)) +
+           Govt_Expenditure_percent_of_GDP * poly(Tariff_Rate, 2) +
+           poly(GDP_per_Capita_PPP, 2) + Inflation_rate, data = TRAIN)
+
+# Model 3: Economic Growth Factors Interaction
+lm3 <- lm(EFS ~ (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP + poly(GDP_Growth_Rate, 2)) +
+           Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate +
+           poly(GDP_per_Capita_PPP, 2) + Inflation_rate + Corporate_Tax_Rate, data = TRAIN)
+
+# Add Predictions to TEST
+TEST2 = TEST %>%
+  add_predictions(lm1, var="pred1") %>%
+  add_predictions(lm2, var="pred2") %>%
+  add_predictions(lm3, var="pred3") %>%
+  add_residuals(lm1, var="resid1") %>%
+  add_residuals(lm2, var="resid2") %>%
+  add_residuals(lm3, var="resid3") %>%
+  select(Country, EFS, pred1:resid3)
+
+# Calculate MAE
+MAE.func(TEST2$resid1)
+MAE.func(TEST2$resid2)
+MAE.func(TEST2$resid3)
+```
+
+
+```{r, warning=FALSE}
+# Create Folds for Cross Validation
+EFI_FOLD = crossv_kfold(EFI_DATA, k=20)
+
+# Train Model for CV (Using model 3)
+train.model.func=function(data){
+  mod = lm(EFS ~ (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP + poly(GDP_Growth_Rate, 2)) +
+           Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate +
+           poly(GDP_per_Capita_PPP, 2) + Inflation_rate + Corporate_Tax_Rate, data = data)
+  return(mod)
+}
+
+# Add Predictions and Residual results from Cros Validation
+EFI_PREDICT = EFI_FOLD %>%
+  mutate(tr.model=map(train,train.model.func)) %>%
+  mutate(predict = map2(test,tr.model,~augment(.y,newdata=.x))) %>%
+  select(predict) %>%
+  unnest(cols=c(predict)) %>%
+  select(Country, EFS, .fitted, .resid) %>%
+  arrange(desc(EFS))
+
+head(EFI_PREDICT, 10)
+
+MAE.func(EFI_PREDICT$.resid)
+```
+
+#Creating a function out of the initial model, the function was not really used
+train.model.func.jin=function(data){
+  mod1 = lm(EFS ~ GDP_per_Capita_PPP + 
+                    Tariff_Rate + 
+                    GDP_Growth_Rate + 
+                    Inflation_rate + 
+                    Tax_Burden_percent_of_GDP + 
+                    Govt_Expenditure_percent_of_GDP + 
+                    Corporate_Tax_Rate,
+                 data = data)
+  return(mod1)
+  }
+
+
+
+```{r}
+# Write CSV
+write.csv(EFI_PREDICT, "EFI_PREDICT.csv", row.names = F)
+write.csv(EFI_DATA, "EFI_DATA.csv", row.names=F)
+```
+
+#Jins Models:
+
+###Model 1: "jin_model1" 
+- very simple model, used stepwise selection with the initial variables 
+```{r}
+#Simple linear regression model created by choosing predictor variables that were chosen by the initial stepwise selcetion method
+jin_model1 <- lm(EFS ~ GDP_per_Capita_PPP + 
+                    Tariff_Rate + 
+                    GDP_Growth_Rate + 
+                    Inflation_rate + 
+                    Tax_Burden_percent_of_GDP + 
+                    Govt_Expenditure_percent_of_GDP + 
+                    Corporate_Tax_Rate,
+                 data = TRAIN)
+summary(jin_model1)
+
+TEST_jin <- TEST %>%
+  add_predictions(jin_model1, var = "Pred_Jin") %>%
+  add_residuals(jin_model1, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#MAE of the simplest model 
+MAE.func(TEST_jin$Resid_Jin)
+```
+```{r, eval=FALSE}
+
+#Creating a function with polynomial inputs so that I can loop through every possible combination of polynomials with my initial predictor variables
+train.model.func.jin=function(data,I,J,K,L,M,N,O){
+  mod=lm(EFS ~ poly(GDP_per_Capita_PPP,I)
+         +poly(Tariff_Rate,J) +
+           poly(GDP_Growth_Rate, K) +
+           poly(Inflation_rate, L) +
+           poly(Tax_Burden_percent_of_GDP, M) + 
+           poly(Govt_Expenditure_percent_of_GDP, N) +
+           poly(Corporate_Tax_Rate, O)
+         ,data=data)
+  return(mod)
+}
+
+
+# Function to train models and compute MAE for all combinations
+train.and.evaluate.models <- function(data){
+  
+# List to store results
+results <- list()
+  
+  # Nested loops to iterate over all combinations of polynomial degrees
+  for(I in 1:4){
+    for(J in 1:4){
+      for(K in 1:4){
+        for(L in 1:4){
+          for(M in 1:4){
+            for(N in 1:4){
+              for(O in 1:4){
+                
+                # Skip combinations where all degrees are 1 (no polynomial terms)
+                if(all(c(I, J, K, L, M, N, O) == 1)) next
+                
+                # Training the model
+                mod <- train.model.func.jin(data, I, J, K, L, M, N, O)
+                
+                # Making predictions
+                predictions <- predict(mod, newdata=data)
+                
+                # Computing MAE
+                mae <- MAE.func(data$EFS - predictions)
+                
+                # Storing results in an empty vector results
+                results[[paste(I, J, K, L, M, N, O, sep="_")]] <- mae
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return(results)
+}
+
+# Call the function with your dataset, remember that we are using the training dataset that Embrey initially created
+results <- train.and.evaluate.models(TRAIN)
+
+# Print the results
+print(results)
+
+# Convert the list to a tibble
+library(tibble)
+results_tibble <- as_tibble(results, .name_repair = "minimal")
+
+# Print the tibble
+print(results_tibble)
+
+#manually transposing the tibble because everything is in columns and arranging it by the lowest to highest
+MAE.results <- results_tibble %>%
+  gather("1_1_1_1_1_1_2":"4_4_4_4_4_4_4", key = "degrees", value = "MAE.values") %>%
+  arrange(MAE.values)
+
+```
+
+
+#Polynomial degrees that minimizes MAE:
+  *4,4,2,2,1,4,3* -> this combination of polynomials gave me the lowest MAE
+
+
+```{r}
+#Creating a linear model with the minimizing polynomial variables and also adding embrey's interaction variables, this model is better than jsut the polynomial model and I named it jin_model2
+jin_model2 <- lm(EFS ~ poly(GDP_per_Capita_PPP, 4) + 
+                    poly(Tariff_Rate, 4) + 
+                    poly(GDP_Growth_Rate, 2) + 
+                    poly(Inflation_rate, 2) + 
+                    (Tax_Burden_percent_of_GDP) + 
+                    poly(Govt_Expenditure_percent_of_GDP, 4) + 
+                    poly(Corporate_Tax_Rate,3) + 
+                   (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP) +
+                   (Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate)
+                 ,data = TRAIN)
+#R-squared is pretty high
+summary(jin_model2)
+
+#Adding predictions and residuals for the above model
+TEST_jin2 <- TEST %>%
+  add_predictions(jin_model2, var = "Pred_Jin") %>%
+  add_residuals(jin_model2, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#achieved the lowest MAE yet of: 3.642329
+MAE.func(TEST_jin2$Resid_Jin)
+```
+
+
+```{r}
+head(TRAIN)
+#After creating jin_model2, I wanted to see if I can bring down the MAE lower, so I looked at the scatter plot relationship between "FDI_Inflow_Millions" and the EFS, excluding some outliers. You can see by running only the first section of the code below that the visualization of EFS and FDI_Inflow_Millions does not tell us much. However, because of the clustered data points, I decided to log FDI_Inflow_Millions to see what happens. Now there is a positive trend that we can work with.
+TRAIN%>%
+  filter(FDI_Inflow_Millions<100000)%>%
+  ggplot() +
+  geom_point(mapping = aes(x = FDI_Inflow_Millions, y = EFS))
+
+#Logged
+TRAIN%>%
+  filter(FDI_Inflow_Millions<100000)%>%
+  ggplot() +
+  geom_point(mapping = aes(x = log(FDI_Inflow_Millions), y = EFS))
+
+#The below code line can be used to justify not using the population variable at all, it is obvious that population does not tell us ANYTHING about EFS which is a little shocking but maybe good to write in paper in a way that this was one of the shocking findings but makes sense because of small yet very successful countries like South Korea and Japan.
+TRAIN%>%
+  filter(Country != "China", Population_Millions<100) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = log(Population_Millions), y = EFS))
+```
+#Implimenting the relationship of log(abs(FDI_Inflow_Millions) and EFS I added three new interaction variables to the "jin_model2"
+```{r}
+
+jin_model4 <- lm(EFS ~ poly(GDP_per_Capita_PPP, 4) + 
+                    poly(Tariff_Rate, 4) + 
+                    poly(GDP_Growth_Rate, 2) + 
+                    poly(Inflation_rate, 2) + 
+                    (Tax_Burden_percent_of_GDP) + 
+                    poly(Govt_Expenditure_percent_of_GDP, 4) + 
+                    poly(Corporate_Tax_Rate,3) + 
+                   (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP) +
+                   (Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate) +
+                   (Corporate_Tax_Rate * Tariff_Rate) + #added because corporations interact with other countries and tariff rate is defenitly a huge component into making corporate decisions
+                   (GDP_Growth_Rate * GDP_per_Capita_PPP) + #(Shot in the dark tbh, but definitely can bs some legitimate reason)
+                    (Inflation_rate * Govt_Expenditure_percent_of_GDP) + #Added this because inflation rate is probably one of the variables that has a relation to everything else(simple economics)
+                    (log(abs(FDI_Inflow_Millions)) * Tariff_Rate) #Added bc the initial positive relation we found was pretty weak and Tariff rate and foreign investments obviously relate to one another
+                 ,data = TRAIN)
+
+#R-squared is pretty high
+summary(jin_model4)
+
+#Adding predictions and residuals for the above model
+TEST_jin4 <- TEST %>%
+  add_predictions(jin_model4, var = "Pred_Jin") %>%
+  add_residuals(jin_model4, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#achieved the lowest MAE yet of: 3.57351
+MAE.func(TEST_jin4$Resid_Jin)
+```
+
+
+
+#What if we do a stepwise selection on the model above?
+
+This is lowkey useless But potentially benefit for paper if yall just need to fill up word count, just say something like we branched out to stepwise but it really didnt do much
+```{r}
+none_model = lm(EFS ~ 1, data = TRAIN)
+
+MSE = (summary(jin_model2)$sigma)^2
+
+step(none_model, scope=list(upper=jin_model2), scale=MSE)
+
+
+jin_model3 = lm(formula = EFS ~ poly(GDP_per_Capita_PPP, 4) + poly(GDP_Growth_Rate, 
+    2) + Govt_Expenditure_percent_of_GDP + poly(Inflation_rate, 
+    2) + poly(Tariff_Rate, 4) + Tax_Burden_percent_of_GDP, data = TRAIN)
+
+summary(jin_model3)
+
+anova(jin_model2, jin_model3)
+
+TEST_jin3 <- TEST %>%
+  add_predictions(jin_model3, var = "Pred_Jin") %>%
+  add_residuals(jin_model3, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#MAE
+MAE.func(TEST_jin3$Resid_Jin)
+
+#STEPWISE REGRESSION DOES NOT HELP, IT GOT RID OF ALL INTERACTION VARIABLES BUT HAVING THEM IS BETTER BUT WITH THE ANOVA TEST THERE IS NO STATISTICAL SIGNIFICANE THAT THE INTERACTION VARIABLES ARE HELPFUL IN PREDICTING, MAE increases by a lot so stepwise did not help
+```
+
+
+
+```{r}
+# Correlations with EFS
+as.data.frame(correlations) %>%
+  arrange(desc(abs(correlations)))
+```
+
+```{r, warning=FALSE}
+# Apply Model (Jin Model 2) to Full Dataset for Plots
+EFI_VISUALIZATION = EFI_DATA %>%
+  add_predictions(jin_model2, var = "pred") %>%
+  add_residuals(jin_model2, var = "resid") %>%
+  select(Country, EFS, pred, resid, SET)
+
+head(EFI_VISUALIZATION, 10)
+```
+
+
+```{r}
+# Best 10 Predictions (lowest abs value of residuals)
+head(EFI_VISUALIZATION %>% arrange(abs(resid)), 10)
+```
+
+```{r}
+# Worst 10 Predictions (highest abs value of residuals)
+head(EFI_VISUALIZATION %>% arrange(desc(abs(resid))), 10)
+```
+
+```{r}
+# Plot Actual EFS vs. Predicted EFS
+ggplot(EFI_VISUALIZATION, aes(x = EFS, y = pred)) +
+  geom_point(aes(color = SET)) +
+  geom_smooth(formula = 'y ~ x', color = "black", linewidth = 0.5, method = "lm", se = FALSE) +
+  xlab("Actual EFS") +
+  ylab("Predicted EFS") +
+  ggtitle("Actual EFS vs. Predicted EFS")
+```
+
+
+```{r}
+head(TRAIN)
+
+jin_model4 <- lm(EFS ~ poly(GDP_per_Capita_PPP, 4) + 
+                    poly(Tariff_Rate, 4) + 
+                    poly(GDP_Growth_Rate, 2) + 
+                    poly(Inflation_rate, 2) + 
+                    (Tax_Burden_percent_of_GDP) + 
+                    poly(Govt_Expenditure_percent_of_GDP, 4) + 
+                    poly(Corporate_Tax_Rate,3) + 
+                   (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP) +
+                   (Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate) +
+                   (Corporate_Tax_Rate * Tariff_Rate) +
+                   (GDP_Growth_Rate * GDP_per_Capita_PPP) +
+                    (Inflation_rate * Govt_Expenditure_percent_of_GDP) +
+                    (log(abs(FDI_Inflow_Millions)) * Tariff_Rate)
+                 ,data = TRAIN)
+#The below code line can be used to justify not using the population variable at all
+TRAIN%>%
+  filter(Country != "China", Population_Millions<100) %>%
+  ggplot() +
+  geom_point(mapping = aes(x = log(Population_Millions), y = EFS))
+
+#Seeing the relationship between FDI inflow and EFS
+TRAIN%>%
+  filter(FDI_Inflow_Millions<100000)%>%
+  ggplot() +
+  geom_point(mapping = aes(x = log(FDI_Inflow_Millions), y = EFS))
+
+#Adding predictions and residuals for the above model
+TEST_jin4 <- TEST %>%
+  add_predictions(jin_model4, var = "Pred_Jin") %>%
+  add_residuals(jin_model4, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#achieved the lowest MAE yet of: 3.57351
+MAE.func(TEST_jin4$Resid_Jin)
+```
+
+
+
+
+Using the 2024 data set:
+
+#Getting rid of the na's and cleaning the 2024 data tha we scraped
+
+```{r}
+EFI_2024 = read_csv("EFI_DATA_2024.csv") %>%
+  select(-c(17)) %>%
+  filter(!is.na(EFS),
+         !is.na(GDP_per_Capita_PPP),
+         !is.na(Tariff_Rate),
+         !is.na(Inflation_rate),
+         !is.na(Tax_Burden_percent_of_GDP),
+         !is.na(FDI_Inflow_Millions),
+         !is.na(Corporate_Tax_Rate),
+         !is.na(Unemployment_rate))
+```
+
+
+
+```{r}
+jin_model4_2024 <- lm(EFS ~ poly(GDP_per_Capita_PPP, 4) + 
+                    poly(Tariff_Rate, 4) + 
+                    poly(GDP_Growth_Rate, 2) + 
+                    poly(Inflation_rate, 2) + 
+                    (Tax_Burden_percent_of_GDP) + 
+                    poly(Govt_Expenditure_percent_of_GDP, 4) + 
+                    poly(Corporate_Tax_Rate,3) + 
+                   (Govt_Expenditure_percent_of_GDP * Tax_Burden_percent_of_GDP) +
+                   (Govt_Expenditure_percent_of_GDP * FDI_Inflow_Millions * Tariff_Rate) +
+                   (Corporate_Tax_Rate * Tariff_Rate) +
+                   (GDP_Growth_Rate * GDP_per_Capita_PPP) +
+                    (Inflation_rate * Govt_Expenditure_percent_of_GDP) +
+                    (log(abs(FDI_Inflow_Millions)) * Tariff_Rate)
+                 ,data = EFI_2024)
+
+summary(jin_model4_2024)
+
+#Adding the predictions to the 2024 EFI data
+EFI_2024_testing <- EFI_2024 %>%
+  add_predictions(jin_model4_2024, var = "Pred_Jin") %>%
+  add_residuals(jin_model4_2024, var = "Resid_Jin") %>%
+  select(EFS, Pred_Jin, Resid_Jin)
+
+#MAE of 3.915176 - pretty good
+MAE.func(EFI_2024_testing$Resid_Jin)
+
+
+```
+
+
+
+
+
+
+
